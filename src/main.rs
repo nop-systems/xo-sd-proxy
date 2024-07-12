@@ -1,36 +1,50 @@
+use std::collections::HashMap;
+use std::fs;
+use reqwest::header::{COOKIE, HeaderMap};
+use rocket::{Build, catch, catchers, get, launch, Rocket, routes, State};
+use rocket::http::Status;
+use rocket::request::FromRequest;
+use rocket::response::content;
+use rocket::serde::json::Json;
+use rocket_dyn_templates::{context, Template};
+use tracing::{debug, info, instrument, trace};
+use tracing_subscriber;
+
+use crate::sd::Target;
+
 mod sd;
 mod xo;
 
+#[derive(Debug, Clone)]
 pub struct Config {
     xoa_url: String,
     xoa_token: String,
 }
 
-use crate::sd::Target;
-use once_cell::sync::Lazy;
-use reqwest::header::{HeaderMap, COOKIE};
-use rocket::http::Status;
-use rocket::response::{content, status};
-use rocket::serde::json::Json;
-use rocket::{catch, catchers, get, launch, routes, Build, Rocket};
-use rocket_dyn_templates::{context, Template};
-use std::collections::HashMap;
-use std::fs;
-use std::hash::Hash;
-use tracing::field::debug;
-use tracing::{debug, error, info, instrument, span, trace, Level};
-use tracing_subscriber;
+impl Config {
+    pub fn new_from_env() -> Self {
+        Config {
+            xoa_url: std::env::var("XOA_URL").expect("XOA_URL must be set"),
+            xoa_token: fs::read_to_string(
+                std::env::var("XOA_TOKEN_FILE").expect("XOA_TOKEN_FILE must be set"),
+            )
+                .expect("Failed to read XOA token file")
+                .trim()
+                .parse()
+                .unwrap(),
+        }
+    }
+}
 
-static CONFIG: Lazy<Config> = Lazy::new(|| Config {
-    xoa_url: std::env::var("XOA_URL").expect("XOA_URL must be set"),
-    xoa_token: fs::read_to_string(
-        std::env::var("XOA_TOKEN_PATH").expect("XOA_TOKEN_PATH must be set"),
-    )
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap(),
-});
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for Config {
+    type Error = ();
+
+    async fn from_request(request: &'r rocket::Request<'_>) -> rocket::request::Outcome<Self, Self::Error> {
+        let config = request.rocket().state::<Config>().unwrap();
+        rocket::request::Outcome::Success((*config).clone())
+    }
+}
 
 #[instrument]
 #[launch]
@@ -41,12 +55,14 @@ async fn launch() -> Rocket<Build> {
         .mount("/", routes![get_sd_targets])
         .register("/", catchers![get_target_list])
         .attach(Template::fairing())
+        .manage(Config::new_from_env())
 }
+
 
 #[instrument]
 #[get("/targets/<job_name>")]
-async fn get_sd_targets(job_name: &str) -> (Status, Json<Vec<Target>>) {
-    let endpoints = build_sd_targets().await.unwrap();
+async fn get_sd_targets(job_name: &str, config: &State<Config>) -> (Status, Json<Vec<Target>>) {
+    let endpoints = build_sd_targets(config.inner()).await.unwrap();
     trace!("{}", serde_json::to_string(&endpoints).unwrap());
 
     info!("Requesting targets for job: {}", job_name);
@@ -63,8 +79,9 @@ async fn get_sd_targets(job_name: &str) -> (Status, Json<Vec<Target>>) {
 
 #[instrument]
 #[catch(404)]
-async fn get_target_list() -> (Status, content::RawHtml<Template>) {
-    let endpoints = build_sd_targets().await.unwrap();
+async fn get_target_list(status: Status, req: &rocket::Request<'_>) -> (Status, content::RawHtml<Template>) {
+    let config = req.guard::<Config>().await.unwrap();
+    let endpoints = build_sd_targets(&config).await.unwrap();
 
     (
         Status::NotFound,
@@ -76,23 +93,23 @@ async fn get_target_list() -> (Status, content::RawHtml<Template>) {
 }
 
 #[instrument]
-async fn get_vms() -> Result<Vec<xo::Vm>, reqwest::Error> {
+async fn get_vms(config: &Config) -> Result<Vec<xo::Vm>, reqwest::Error> {
     let full_url = format!(
-        "{}/rest/v0/vms?fields=name_label,tags,mainIpAddress",
-        CONFIG.xoa_url
+        "{}/rest/v0/vms?fields=name_label,tags,main_ip_address",
+        config.xoa_url
     );
 
     let mut request_header = HeaderMap::new();
     request_header.insert(
         COOKIE,
-        format!("authenticationToken={}", CONFIG.xoa_token)
+        format!("authenticationToken={}", config.xoa_token)
             .parse()
             .unwrap(),
     );
 
     debug!("Requesting VMs from XOA: {}", full_url);
     let client = reqwest::Client::new();
-    let mut response_full = client.get(full_url).headers(request_header).send().await?;
+    let response_full = client.get(full_url).headers(request_header).send().await?;
 
     let response = response_full.json::<Vec<xo::Vm>>().await?;
 
@@ -100,10 +117,10 @@ async fn get_vms() -> Result<Vec<xo::Vm>, reqwest::Error> {
 }
 
 #[instrument]
-async fn build_sd_targets() -> Result<HashMap<String, Vec<sd::Target>>, reqwest::Error> {
+async fn build_sd_targets(config: &Config) -> Result<HashMap<String, Vec<sd::Target>>, reqwest::Error> {
     let mut endpoints: HashMap<String, Vec<sd::Target>> = HashMap::new();
     // Get VMs from XOA and assign them to targets based on the tags of format "prometheus:job:<job_name>"
-    let vms = get_vms().await?;
+    let vms = get_vms(config).await?;
 
     for vm in vms {
         debug!("Processing VM: {}", vm.name_label);
@@ -111,7 +128,7 @@ async fn build_sd_targets() -> Result<HashMap<String, Vec<sd::Target>>, reqwest:
         let mut probes: HashMap<String, sd::Target> = HashMap::new();
         let mut global_labels: HashMap<String, String> = HashMap::new();
 
-        if vm.mainIpAddress.is_none() {
+        if vm.main_ip_address.is_none() {
             continue;
         }
 
@@ -139,7 +156,7 @@ async fn build_sd_targets() -> Result<HashMap<String, Vec<sd::Target>>, reqwest:
                     if job_name == label_key {
                         target.targets = vec![format!(
                             "{}:{}",
-                            vm.mainIpAddress.clone().unwrap(),
+                            vm.main_ip_address.clone().unwrap(),
                             label_value
                         )];
                         trace!(
@@ -159,7 +176,7 @@ async fn build_sd_targets() -> Result<HashMap<String, Vec<sd::Target>>, reqwest:
                     if job_name == label_key {
                         target.targets = vec![format!(
                             "{}:{}",
-                            vm.mainIpAddress.clone().unwrap(),
+                            vm.main_ip_address.clone().unwrap(),
                             label_value
                         )];
                         trace!(
@@ -176,10 +193,10 @@ async fn build_sd_targets() -> Result<HashMap<String, Vec<sd::Target>>, reqwest:
             }
         }
 
-        for (_, mut target) in &mut probes {
+        for (_, target) in &mut probes {
             target.labels.extend(global_labels.clone().into_iter());
             if target.targets.is_empty() {
-                target.targets = vec![vm.mainIpAddress.clone().unwrap()];
+                target.targets = vec![vm.main_ip_address.clone().unwrap()];
             }
         }
 
